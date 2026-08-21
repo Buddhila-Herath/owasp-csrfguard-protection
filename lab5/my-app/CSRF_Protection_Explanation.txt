@@ -1,0 +1,175 @@
+SSD - Lab 5
+Preventing CSRF vulnerability using OWASP CSRFGuard (Synchronizer Token Pattern)
+==================================================================================
+
+1. Summary
+----------
+This document explains the CSRF vulnerability present in the original my-app
+web application, the fix applied using the OWASP CSRFGuard library
+(Synchronizer Token Pattern), the exact configuration changes made, and the
+test evidence collected before and after the fix that proves the protection
+works.
+
+
+2. The original vulnerability
+------------------------------
+The application flow is:
+  index.jsp  -->  (POST name)  -->  welcome.jsp  -->  sets a "name" cookie
+                                                        (valid for 5 minutes)
+                                                        and shows "Welcome!! <name>"
+
+welcome.jsp decided whether to show the welcome message purely based on
+whether a valid "name" cookie was present on the incoming request. Cookies
+are attached automatically by the browser to every request sent to a given
+domain, no matter which page or site actually triggered that request. This
+is exactly the weakness that makes Cross-Site Request Forgery possible: the
+server cannot tell a request that genuinely originated from the
+application's own index.jsp form apart from a forged request sent by an
+attacker's page, an auto-submitting form, or an <img>/<script> tag hosted on
+a completely different site - because the browser attaches the same valid
+cookie to both.
+
+Test evidence (BEFORE the fix), reproduced against a locally running Tomcat
+instance:
+
+  1) POST a name to welcome.jsp (simulating the legitimate index.jsp submit):
+       POST /my-app/welcome.jsp   name=Buddhila
+       -> HTTP 200, "Welcome!!   Buddhila"
+       -> Server sets cookie: name=Buddhila (Max-Age = 300 seconds)
+
+  2) Re-using ONLY that cookie, send a direct/forged GET straight to
+     welcome.jsp (no form submission, no token, exactly like a forged
+     cross-site request would look to the server):
+       GET /my-app/welcome.jsp   (Cookie: name=Buddhila)
+       -> HTTP 200, "Welcome!!   Buddhila"
+
+  The second request succeeded purely because the cookie was valid and the
+  URL matched - proving any attacker who can get the victim's browser to
+  send a request to this URL (while the 5-minute cookie is still alive)
+  can obtain the same response the real user would get. This confirms the
+  vulnerability described in the lab (steps 7-8).
+
+
+3. The fix: OWASP CSRFGuard (Synchronizer Token Pattern)
+----------------------------------------------------------
+OWASP CSRFGuard 3.0.0 was added to the project and configured to implement
+the Synchronizer Token Pattern. The following changes were made:
+
+  a) pom.xml
+     Added the Maven dependency:
+       groupId:    org.owasp
+       artifactId: csrfguard
+       version:    3.0.0
+
+  b) WEB-INF/web.xml
+     Added:
+       - context-param Owasp.CsrfGuard.Config -> WEB-INF/Owasp.CsrfGuard.properties
+       - context-param Owasp.CsrfGuard.Config.Print -> true
+       - filter "CSRFGuard" (org.owasp.csrfguard.CsrfGuardFilter) mapped to /*
+       - listener CsrfGuardServletContextListener
+       - listener CsrfGuardHttpSessionListener
+
+  c) WEB-INF/Owasp.CsrfGuard.properties (new file)
+     Key settings:
+       - TokenName / SessionKey = OWASP_CSRFTOKEN
+       - TokenLength = 32, PRNG = SHA1PRNG (random, unguessable token)
+       - TokenPerPage = true
+       - Protect = true, protected.index = /my-app/welcome.jsp
+       - Logger = ConsoleLogger, with an action.Log entry that records
+         "potential cross-site request forgery attack thwarted(user %user%,
+         ip %remote_ip%)" whenever a request is rejected
+       - Redirect action configured for blocked requests
+
+  d) index.jsp
+     - Added the CSRFGuard taglib directive:
+         <%@ taglib uri="http://www.owasp.org/index.php/Category:OWASP_CSRFGuard_Project/Owasp.CsrfGuard.tld" prefix="csrf" %>
+     - Added a hidden field inside the form that submits to welcome.jsp:
+         <input type="hidden" name="<csrf:token-name/>"
+                value="<csrf:token-value uri="welcome.jsp"/>"/>
+
+
+4. How the fix works
+----------------------
+1. When index.jsp is rendered, the CSRFGuard tag library generates a random,
+   unpredictable token and stores it server-side in the user's HttpSession
+   (tracked via CsrfGuardHttpSessionListener). The same token value is
+   embedded as a hidden form field (OWASP_CSRFTOKEN) in the HTML page sent
+   to the browser.
+
+2. CsrfGuardFilter is mapped to /* , so every request reaching the
+   application is intercepted before it can reach welcome.jsp. The filter
+   reads the token submitted with the request as a request parameter (not
+   a cookie) and compares it against the token stored server-side in that
+   user's session.
+
+3. Because the token is delivered as page content rather than as a cookie,
+   the browser does NOT attach it automatically to requests initiated from
+   other origins the way it does with cookies. A forged cross-site request
+   can still rely on the browser auto-sending the "name" cookie, but it has
+   no way to obtain the correct OWASP_CSRFTOKEN value, because:
+     - the token is random and long (32-byte, SHA1PRNG-generated) - it
+       cannot be guessed,
+     - it is scoped to the user's session and only ever rendered inside
+       index.jsp's own response - the browser's same-origin policy stops a
+       malicious page on another site from reading it out of that response,
+       and
+     - it is never stored in a cookie, so unlike the "name" cookie it
+       cannot silently "ride along" with a forged request.
+
+4. If the token is missing, wrong, or was never issued for that session,
+   CsrfGuardFilter blocks the request before welcome.jsp executes, logs the
+   attempt, and can redirect the user instead of processing the forged
+   request.
+
+
+5. Test evidence (AFTER the fix)
+-----------------------------------
+Same local Tomcat setup, my-app.war rebuilt with the CSRFGuard changes:
+
+  1) GET index.jsp -> response body now contains a real, freshly generated
+     token, e.g.:
+       <input type="hidden" name="OWASP_CSRFTOKEN"
+              value="4VE3-AG6F-PLMY-UMJ1-QFRY-WT9C-WJOR-273F"/>
+
+  2) Legitimate submit - POST to welcome.jsp WITH the correct token and
+     name parameter (as the real form would send):
+       -> HTTP 200, "Welcome!!   Buddhila"   (works normally)
+
+  3) Forged direct GET to welcome.jsp, cookie present but NO token
+     (exactly reproducing the earlier "vulnerable" attack from section 2):
+       -> HTTP 200, Content-Length: 0   (welcome.jsp never executes)
+
+  4) Forged POST with the "name" parameter but NO CSRF token
+     (a classic auto-submitting-form CSRF attack):
+       -> HTTP 200, Content-Length: 0   (blocked)
+
+  5) Forged POST with an incorrect/guessed token value:
+       -> HTTP 200, Content-Length: 0   (blocked)
+
+  In every blocked case (3, 4, 5) the server log recorded:
+       [Error] potential cross-site request forgery attack thwarted
+       (user <anonymous>, ip 0:0:0:0:0:0:0:1)
+  which is precisely the action.Log message configured in
+  Owasp.CsrfGuard.properties, proving CSRFGuard actively detected and
+  stopped each forged request rather than the response simply failing for
+  an unrelated reason.
+
+
+6. Conclusion
+---------------
+Before the fix, welcome.jsp trusted the "name" cookie alone, and since
+cookies are sent automatically by the browser regardless of which site
+triggered the request, any attacker able to induce a victim's browser to
+hit welcome.jsp (link, auto-submitting form, image tag, etc.) could obtain
+the same authenticated response as the real user - a textbook CSRF
+vulnerability.
+
+After adding OWASP CSRFGuard, every state-changing request must now also
+present a random, per-session, per-page synchronizer token that is
+delivered only inside the application's own legitimately-rendered page and
+is never exposed through a cookie. An attacker's forged request can still
+carry the victim's cookies, but cannot obtain or guess this token, so the
+CsrfGuardFilter rejects the request before welcome.jsp ever runs. This is
+confirmed directly by the test evidence above: identical forged requests
+that succeeded before the fix are blocked and logged after the fix, while
+requests genuinely originating from index.jsp continue to work normally.
