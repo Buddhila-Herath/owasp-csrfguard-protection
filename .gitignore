@@ -1,0 +1,12 @@
+# Downloaded/extracted Tomcat runtime (not part of the submission)
+tomcat/
+
+# Leftover scratch test project
+vuln-test/
+
+# Maven build output
+**/target/
+
+# IDE files
+.idea/
+*.iml
